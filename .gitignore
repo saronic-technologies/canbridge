@@ -1,0 +1,9 @@
+.envrc
+.direnv
+
+/target
+
+result
+
+.nixos-test-history
+
