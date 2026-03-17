@@ -1,0 +1,28 @@
+name: cargo build, cargo test, nixos VM test
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: DeterminateSystems/nix-installer-action@main
+    - name: Enter nix shell
+      run: nix develop
+    - name: Build
+      run: cargo build --verbose
+    - name: Run cargo tests
+      run: cargo test --verbose
+    - name: Run NixOS VM test
+      run: nix build .#canbridge-test
+      
