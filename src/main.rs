@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use socketcan::{CanFdSocket, Socket};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::{self, Sender, Receiver};
@@ -218,9 +218,10 @@ fn handle_connection(stream: TcpStream, iface: &str) -> Result<()> {
     // This allows the reader to filter out looped-back frames
     let (sent_frames_tx, sent_frames_rx) = mpsc::channel();
 
-    // Clone TCP stream for bidirectional communication
+    // Clone TCP stream for bidirectional communication; keep `stream` itself as a shutdown handle so
+    // that when one direction's loop exits we can tear the connection down and unblock the other.
     let stream_read = stream.try_clone().context("Failed to clone TCP stream")?;
-    let stream_write = stream;
+    let stream_write = stream.try_clone().context("Failed to clone TCP stream for writer")?;
 
     let iface_clone = iface.to_string();
 
@@ -236,6 +237,11 @@ fn handle_connection(stream: TcpStream, iface: &str) -> Result<()> {
     if let Err(e) = tcp_to_can_loop(can_write, stream_read, &iface_clone, sent_frames_tx) {
         error!(error = %e, "[TCP→CAN] Loop exited with error");
     }
+
+    // The reverse loop has exited, so this connection is finished. Shut the socket down before joining
+    // so the CAN→TCP thread's next TCP write fails and it returns, instead of hanging join() forever
+    // while the reverse path is dead.
+    let _ = stream.shutdown(Shutdown::Both);
 
     // Wait for the other thread
     let _ = can_to_tcp_handle.join();
@@ -263,9 +269,10 @@ fn handle_connection_with_can_socket(
     // Create a channel for the writer to notify the reader about sent frames
     let (sent_frames_tx, sent_frames_rx) = mpsc::channel();
 
-    // Clone TCP stream for bidirectional communication
+    // Clone TCP stream for bidirectional communication; keep `stream` itself as a shutdown handle so
+    // that when one direction's loop exits we can tear the connection down and unblock the other.
     let stream_read = stream.try_clone().context("Failed to clone TCP stream")?;
-    let stream_write = stream;
+    let stream_write = stream.try_clone().context("Failed to clone TCP stream for writer")?;
 
     let iface_clone = iface.to_string();
 
@@ -281,6 +288,11 @@ fn handle_connection_with_can_socket(
     if let Err(e) = tcp_to_can_loop(can_write, stream_read, &iface_clone, sent_frames_tx) {
         error!(error = %e, "[TCP→CAN] Loop exited with error");
     }
+
+    // The reverse loop has exited, so this connection is finished. Shut the socket down before joining
+    // so the CAN→TCP thread's next TCP write fails and it returns, instead of hanging join() forever
+    // while the reverse path is dead.
+    let _ = stream.shutdown(Shutdown::Both);
 
     // Wait for the other thread
     let _ = can_to_tcp_handle.join();
