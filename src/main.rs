@@ -64,6 +64,43 @@ fn enable_canfd(socket: &CanFdSocket) -> Result<()> {
     Ok(())
 }
 
+/// Whether the CAN interface is currently up, read from sysfs. A missing file means the netdev is
+/// gone (treated as down).
+fn iface_is_up(iface: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/operstate"))
+        .map(|s| operstate_is_up(&s))
+        .unwrap_or(false)
+}
+
+/// Decide up/down from an `operstate` string. CAN reports `unknown` when up, so treat anything that
+/// is not `down` (or empty) as up.
+fn operstate_is_up(operstate: &str) -> bool {
+    let s = operstate.trim();
+    !s.is_empty() && s != "down"
+}
+
+/// Watch the CAN interface and force a process exit when it flaps down→up, so systemd reopens a fresh
+/// socket. A raw CAN socket stays "open" across an interface down/up but goes stale (frames stop) and
+/// the daemon would otherwise never notice. Runs for the life of the process.
+fn spawn_link_monitor(iface: &str) {
+    let iface = iface.to_string();
+    thread::spawn(move || {
+        let mut prev_up = iface_is_up(&iface);
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            let up = iface_is_up(&iface);
+            if up && !prev_up {
+                warn!(
+                    interface = %iface,
+                    "CAN interface came back up; exiting so systemd reopens a fresh socket"
+                );
+                std::process::exit(1);
+            }
+            prev_up = up;
+        }
+    });
+}
+
 /// Run the CAN → TCP forwarding loop with deduplication
 ///
 /// This function reads frames from the CAN bus and forwards them over TCP.
@@ -364,6 +401,10 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Recover from an interface flap: a raw CAN socket held across a down/up goes stale, so watch the
+    // link and exit (systemd restarts us) when it returns, reopening a fresh socket.
+    spawn_link_monitor(&args.iface);
 
     match args.mode {
         Mode::Listen => run_server(&args.addr, &args.iface),
