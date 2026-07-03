@@ -126,6 +126,17 @@ fn can_to_tcp_loop(
     }
 }
 
+/// Whether a CAN write error is transient — the frame can be dropped and the loop kept alive,
+/// rather than tearing the whole connection down. `ENOBUFS` means the TX qdisc was momentarily full
+/// (common on the slow SPI MCP2515 under a burst of frames); `EAGAIN`/`EWOULDBLOCK` mean the write
+/// would block. Any other errno is treated as fatal. Pure so it is unit-testable without a socket.
+fn is_transient_write_err(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(code) if code == libc::ENOBUFS || code == libc::EAGAIN || code == libc::EWOULDBLOCK
+    )
+}
+
 /// Run the TCP → CAN forwarding loop with deduplication tracking
 ///
 /// This function receives frames from TCP and sends them to the CAN bus.
@@ -170,6 +181,14 @@ fn tcp_to_can_loop(
         let _ = sent_frames_tx.send(hash);
 
         if let Err(e) = socket.write_frame(&frame) {
+            // A transient TX-queue-full (ENOBUFS) or would-block must NOT kill the reverse loop —
+            // that used to strand the whole connection (the ack path stayed dead until can0 was
+            // toggled). Drop this one frame and keep serving; the queue drains as the bus catches up.
+            if is_transient_write_err(&e) {
+                warn!(error = %e, "[TCP→CAN] Transient CAN write error; dropping frame");
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             error!(error = %e, "[TCP→CAN] Failed to write frame to CAN");
             // Note: We already sent the hash, but the reader will eventually
             // clean it up since no matching frame will arrive
