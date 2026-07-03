@@ -411,3 +411,36 @@ fn main() -> Result<()> {
         Mode::Connect => run_client(&args.addr, &args.iface),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{is_transient_write_err, operstate_is_up};
+    use std::io::Error;
+
+    #[test]
+    fn transient_write_errors_keep_the_loop_alive() {
+        assert!(is_transient_write_err(&Error::from_raw_os_error(libc::ENOBUFS)));
+        // EAGAIN == EWOULDBLOCK on Linux.
+        assert!(is_transient_write_err(&Error::from_raw_os_error(libc::EAGAIN)));
+        assert!(is_transient_write_err(&Error::from_raw_os_error(libc::EWOULDBLOCK)));
+    }
+
+    #[test]
+    fn fatal_write_errors_are_not_transient() {
+        assert!(!is_transient_write_err(&Error::from_raw_os_error(libc::ENETDOWN)));
+        assert!(!is_transient_write_err(&Error::from_raw_os_error(libc::EPERM)));
+        // No errno at all (not an OS error) is treated as fatal.
+        assert!(!is_transient_write_err(&Error::other("no errno")));
+    }
+
+    #[test]
+    fn operstate_is_up_unless_down_or_empty() {
+        assert!(operstate_is_up("up"));
+        assert!(operstate_is_up("unknown")); // CAN reports unknown when up
+        assert!(operstate_is_up("up\n")); // trailing newline from sysfs
+        assert!(!operstate_is_up("down"));
+        assert!(!operstate_is_up("down\n"));
+        assert!(!operstate_is_up(""));
+        assert!(!operstate_is_up("   "));
+    }
+}
