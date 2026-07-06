@@ -164,63 +164,140 @@ fn run_link_monitor(iface: &str) -> Result<()> {
     }
 }
 
+/// Dedup notifications from the TCP→CAN writer to the CAN→TCP reader. The writer registers each frame
+/// it puts on the bus so the reader can drop the kernel loopback; if a write is dropped (transient
+/// error) it retracts the hash, so a legitimate incoming frame with the same ID+data isn't filtered.
+enum DedupMsg {
+    /// A frame was written to CAN — expect and filter its loopback.
+    Sent(u64),
+    /// A frame was dropped before reaching the bus — no loopback will come, so forget the hash.
+    Dropped(u64),
+}
+
+/// Pending loopbacks for a given hash: a count (identical frames can be in flight at once) plus the
+/// most recent timestamp, used only by the eviction safety net.
+struct Pending {
+    count: u32,
+    last: Instant,
+}
+
+/// Tracks hashes of frames the writer put on the bus so the reader can drop their kernel loopback.
+/// A `Sent` adds one pending loopback for a hash; a `Dropped` retracts one (its write never reached
+/// the bus); [`is_loopback`] consumes one pending loopback; [`evict_older_than`] is a safety net
+/// against unbounded growth. The per-hash count is what lets a dropped frame retract only its own
+/// instance instead of cancelling a concurrent successful send's still-pending loopback.
+#[derive(Default)]
+struct LoopbackFilter {
+    sent: HashMap<u64, Pending>,
+}
+
+impl LoopbackFilter {
+    fn apply(&mut self, msg: DedupMsg, now: Instant) {
+        match msg {
+            DedupMsg::Sent(h) => {
+                let e = self.sent.entry(h).or_insert(Pending { count: 0, last: now });
+                e.count += 1;
+                e.last = now;
+            }
+            // The writer dropped this frame, so one fewer loopback will arrive — retract a single
+            // pending instance (not the whole hash), so a concurrent successful send of the same
+            // ID+data keeps its pending loopback and a real incoming frame isn't wrongly filtered.
+            DedupMsg::Dropped(h) => self.consume(h),
+        }
+    }
+
+    /// Drop one pending loopback for `hash`, removing the entry when it reaches zero.
+    fn consume(&mut self, hash: u64) {
+        if let Some(e) = self.sent.get_mut(&hash) {
+            e.count -= 1;
+            if e.count == 0 {
+                self.sent.remove(&hash);
+            }
+        }
+    }
+
+    /// Drop entries older than `threshold`; returns how many were evicted.
+    fn evict_older_than(&mut self, now: Instant, threshold: Duration) -> usize {
+        let before = self.sent.len();
+        self.sent
+            .retain(|_, p| now.duration_since(p.last) < threshold);
+        before - self.sent.len()
+    }
+
+    /// True if `hash` matches a pending send (consuming one) — i.e. this is our own loopback.
+    fn is_loopback(&mut self, hash: u64) -> bool {
+        if self.sent.contains_key(&hash) {
+            self.consume(hash);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.sent.len()
+    }
+}
+
 /// Run the CAN → TCP forwarding loop with deduplication
 ///
 /// This function reads frames from the CAN bus and forwards them over TCP.
-/// It maintains a local HashSet of recently sent frame hashes (received via channel)
+/// It maintains a local map of recently sent frame hashes (received via channel)
 /// to filter out frames that we transmitted ourselves (which appear due to kernel loopback).
 fn can_to_tcp_loop(
     socket: CanFdSocket,
     mut stream: TcpStream,
     iface: &str,
-    sent_frames_rx: Receiver<u64>,
+    sent_frames_rx: Receiver<DedupMsg>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     info!(interface = %iface, "[CAN→TCP] Starting forwarding loop");
 
-    // Local map of frames we've recently sent with their timestamps
-    let mut sent_frames: HashMap<u64, Instant> = HashMap::new();
+    // Tracks frames we've recently written so their kernel loopback can be filtered.
+    let mut filter = LoopbackFilter::default();
     // Threshold for removing old entries (100ms should be more than enough for loopback)
     const CLEANUP_THRESHOLD: Duration = Duration::from_millis(100);
 
     loop {
         // The socket has a read timeout so this loop can observe `shutdown`: without it a blocking
         // read on an idle interface would park forever, hanging the connection teardown's join().
-        let frame = match socket.read_frame() {
-            Ok(frame) => frame,
+        let maybe_frame = match socket.read_frame() {
+            Ok(frame) => Some(frame),
             Err(e) if is_read_timeout(&e) => {
                 if shutdown.load(Ordering::Relaxed) {
                     return Ok(());
                 }
-                continue;
+                None
             }
             Err(e) => return Err(e).context("Failed to read frame from CAN"),
+        };
+
+        // Drain pending dedup notifications and evict stale entries EVERY iteration — including idle
+        // read timeouts — so neither the unbounded channel nor the filter map can grow without bound
+        // while the writer drops frames (ENOBUFS) and no loopback traffic wakes the reader.
+        let now = Instant::now();
+        while let Ok(msg) = sent_frames_rx.try_recv() {
+            filter.apply(msg, now);
+        }
+        let removed = filter.evict_older_than(now, CLEANUP_THRESHOLD);
+        if removed > 0 {
+            debug!(
+                removed,
+                remaining = filter.len(),
+                "[CAN→TCP] Cleaned up old frame hashes"
+            );
+        }
+
+        let frame = match maybe_frame {
+            Some(frame) => frame,
+            None => continue,
         };
 
         let wire = can_to_wire(&frame);
         let hash = frame_hash(wire.can_id, &wire.data);
 
-        // Drain any pending hashes from the channel AFTER receiving a frame
-        // This ensures we catch any hashes that were sent while we were blocked on read_frame
-        let now = Instant::now();
-        while let Ok(hash) = sent_frames_rx.try_recv() {
-            sent_frames.insert(hash, now);
-        }
-
-        // Clean up old entries that are past the threshold
-        // This prevents unbounded growth while avoiding race conditions
-        let old_count = sent_frames.len();
-        sent_frames.retain(|_, timestamp| now.duration_since(*timestamp) < CLEANUP_THRESHOLD);
-        if old_count > sent_frames.len() {
-            debug!(
-                removed = old_count - sent_frames.len(),
-                remaining = sent_frames.len(),
-                "[CAN→TCP] Cleaned up old frame hashes"
-            );
-        }
-
         // Check if this is a frame we recently sent (looped back)
-        if sent_frames.remove(&hash).is_some() {
+        if filter.is_loopback(hash) {
             // This is a looped-back frame we sent, skip it
             debug!(interface = %iface, "[CAN→TCP] Skipping looped-back frame");
             continue;
@@ -255,14 +332,15 @@ fn is_transient_write_err(e: &std::io::Error) -> bool {
 
 /// Run the TCP → CAN forwarding loop with deduplication tracking
 ///
-/// This function receives frames from TCP and sends them to the CAN bus.
-/// After successfully sending each frame, it notifies the reader thread via channel
-/// so the reader can filter out the loopback when it appears.
+/// This function receives frames from TCP and sends them to the CAN bus. It notifies the reader
+/// thread of each frame's hash *before* writing (so the reader has it registered before the kernel
+/// loopback can arrive), then retracts the hash if the write is dropped so the reader doesn't filter
+/// a legitimate incoming frame with the same ID+data.
 fn tcp_to_can_loop(
     socket: CanFdSocket,
     mut stream: TcpStream,
     iface: &str,
-    sent_frames_tx: Sender<u64>,
+    sent_frames_tx: Sender<DedupMsg>,
 ) -> Result<()> {
     info!(interface = %iface, "[TCP→CAN] Starting forwarding loop");
 
@@ -290,11 +368,11 @@ fn tcp_to_can_loop(
             }
         };
 
-        // Notify the reader thread BEFORE sending to avoid race condition
-        // where the loopback arrives before the hash is in the reader's set
+        // Register the hash with the reader BEFORE writing, to avoid the race where the kernel
+        // loopback reaches the reader before the hash is in its map.
         let hash = frame_hash(wire.can_id, &wire.data);
         // Ignore send errors - if the receiver is gone, we're shutting down anyway
-        let _ = sent_frames_tx.send(hash);
+        let _ = sent_frames_tx.send(DedupMsg::Sent(hash));
 
         if let Err(e) = socket.write_frame(&frame) {
             // A transient TX-queue-full (ENOBUFS) or would-block must NOT kill the reverse loop —
@@ -302,12 +380,15 @@ fn tcp_to_can_loop(
             // toggled). Drop this one frame and keep serving; the queue drains as the bus catches up.
             if is_transient_write_err(&e) {
                 warn!(error = %e, "[TCP→CAN] Transient CAN write error; dropping frame");
+                // The frame never hit the bus, so no loopback will come: retract the hash so it can't
+                // falsely filter a real incoming frame with the same ID+data (within CLEANUP_THRESHOLD).
+                let _ = sent_frames_tx.send(DedupMsg::Dropped(hash));
                 thread::sleep(Duration::from_millis(1));
                 continue;
             }
             error!(error = %e, "[TCP→CAN] Failed to write frame to CAN");
-            // Note: We already sent the hash, but the reader will eventually
-            // clean it up since no matching frame will arrive
+            // Fatal error: we return and the connection is torn down, so the stale hash is moot
+            // (the reader thread exits with the connection).
             return Err(e.into());
         }
         debug!(interface = %iface, "[TCP→CAN] Wrote frame to CAN");
@@ -323,7 +404,7 @@ fn handle_connection(stream: TcpStream, iface: &str) -> Result<()> {
     let can_write = CanFdSocket::open(iface).context("Failed to open CAN socket for writing")?;
 
     // Bound the CAN read so the reader thread can observe teardown even on an idle interface.
-    if let Err(e) = can_read.set_read_timeout(CAN_READ_TIMEOUT) {
+    if let Err(e) = can_read.set_read_timeout(Some(CAN_READ_TIMEOUT)) {
         warn!(error = %e, "Could not set CAN read timeout");
     }
 
@@ -381,7 +462,7 @@ fn handle_connection_with_can_socket(
     let can_write = CanFdSocket::open(iface).context("Failed to open CAN socket for writing")?;
 
     // Bound the CAN read so the reader thread can observe teardown even on an idle interface.
-    if let Err(e) = can_read.set_read_timeout(CAN_READ_TIMEOUT) {
+    if let Err(e) = can_read.set_read_timeout(Some(CAN_READ_TIMEOUT)) {
         warn!(error = %e, "Could not set CAN read timeout");
     }
 
@@ -497,11 +578,15 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_read_timeout, is_transient_write_err, link_is_up, process_link_datagram};
+    use super::{
+        is_read_timeout, is_transient_write_err, link_is_up, process_link_datagram, DedupMsg,
+        LoopbackFilter,
+    };
     use netlink_packet_core::NetlinkMessage;
     use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage, State};
     use netlink_packet_route::RouteNetlinkMessage;
     use std::io::{Error, ErrorKind};
+    use std::time::{Duration, Instant};
 
     /// Serialize a single RTM_NEWLINK datagram for `iface` reporting operstate `oper`.
     fn newlink(iface: &str, oper: State) -> Vec<u8> {
@@ -513,6 +598,51 @@ mod tests {
         let mut buf = vec![0u8; msg.buffer_len()];
         msg.serialize(&mut buf);
         buf
+    }
+
+    #[test]
+    fn dropped_retracts_a_pending_loopback_hash() {
+        let now = Instant::now();
+        let mut f = LoopbackFilter::default();
+        f.apply(DedupMsg::Sent(42), now);
+        // The write was dropped, so no loopback will come: the hash must be retracted, and a real
+        // incoming frame with the same hash must NOT be filtered.
+        f.apply(DedupMsg::Dropped(42), now);
+        assert!(!f.is_loopback(42));
+        assert_eq!(f.len(), 0);
+    }
+
+    #[test]
+    fn sent_hash_filters_exactly_one_loopback() {
+        let now = Instant::now();
+        let mut f = LoopbackFilter::default();
+        f.apply(DedupMsg::Sent(7), now);
+        assert!(f.is_loopback(7)); // our loopback is filtered once...
+        assert!(!f.is_loopback(7)); // ...and a later real frame with the same hash passes through
+    }
+
+    #[test]
+    fn a_drop_retracts_only_its_own_instance_not_a_concurrent_send() {
+        let now = Instant::now();
+        let mut f = LoopbackFilter::default();
+        // Two same-hash writes in flight: the first succeeded, the second was dropped (ENOBUFS).
+        f.apply(DedupMsg::Sent(9), now);
+        f.apply(DedupMsg::Sent(9), now);
+        f.apply(DedupMsg::Dropped(9), now);
+        // The dropped write retracts only one instance, so the successful write's loopback is still
+        // filtered (not echoed back over TCP) — and only that one.
+        assert!(f.is_loopback(9));
+        assert!(!f.is_loopback(9));
+    }
+
+    #[test]
+    fn stale_hashes_are_evicted_after_the_threshold() {
+        let start = Instant::now();
+        let mut f = LoopbackFilter::default();
+        f.apply(DedupMsg::Sent(1), start);
+        let later = start + Duration::from_millis(101);
+        assert_eq!(f.evict_older_than(later, Duration::from_millis(100)), 1);
+        assert!(!f.is_loopback(1));
     }
 
     #[test]
