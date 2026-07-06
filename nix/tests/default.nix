@@ -204,6 +204,30 @@ flake-utils.lib.eachDefaultSystem (system:
             server.succeed("diff ${candump-can1-log} /tmp/candump-can1.log")
             client.succeed("diff ${candump-vcan0-log} /tmp/candump-vcan0.log")
             client.succeed("diff ${candump-vcan1-log} /tmp/candump-vcan1.log")
+
+            # --- Interface-flap recovery ---
+            # canbridge holds a raw CAN socket that goes stale across an interface down->up. Its
+            # internal link monitor (spawn_link_monitor, src/main.rs) must observe the down->up
+            # transition, log, and exit(1) so systemd (Restart=always) reopens a fresh socket. There
+            # is deliberately no external watchdog. Hold the link down > the monitor's ~1s poll so it
+            # observes the transition.
+            baseline = int(client.succeed("wc -l < /tmp/candump-vcan0.log").strip())
+            server.succeed("ip link set can0 down; sleep 3; ip link set can0 up")
+            server.wait_until_succeeds(
+                "journalctl -u canbridge-server-can0 | grep -q 'came back up'", timeout=30
+            )
+
+            # --- End-to-end recovers (no external watchdog) ---
+            # The server bridge restarted with a fresh can0 socket and the connect-mode client
+            # reconnected. A frame injected on can0 must forward through TCP to the client's vcan0
+            # again: assert the unflapped vcan0 capture grows strictly above the pre-flap baseline
+            # (stale lines can't pass it).
+            for _ in range(10):
+                server.succeed(f"cansend can0 {frame}")
+                time.sleep(1)
+            client.wait_until_succeeds(
+                f"test $(wc -l < /tmp/candump-vcan0.log) -gt {baseline}", timeout=30
+            )
         '';
       };
     }
