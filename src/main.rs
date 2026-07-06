@@ -1,9 +1,12 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
+use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage, State};
+use netlink_packet_route::RouteNetlinkMessage;
+use netlink_sys::{protocols::NETLINK_ROUTE, Socket as NetlinkSocket, SocketAddr as NetlinkAddr};
 use socketcan::{CanFdSocket, Socket};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::collections::HashMap;
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, Receiver};
 use std::sync::Arc;
@@ -39,70 +42,126 @@ use canbridge::{
     can_to_wire, frame_hash, recv_wire, send_wire, wire_to_can,
 };
 
-// SocketCAN constants
-const SOL_CAN_RAW: libc::c_int = 101;
-const CAN_RAW_FD_FRAMES: libc::c_int = 5;
 /// How long a CAN read blocks before returning so the loop can check whether teardown was requested.
 const CAN_READ_TIMEOUT: Duration = Duration::from_millis(500);
+/// Netlink multicast group for link (interface) state-change events (`RTNLGRP_LINK`).
+const RTNLGRP_LINK: u32 = 1;
+/// Receive buffer for the netlink link-event socket.
+const NETLINK_RECV_BUF: usize = 8192;
 
-/// Enable CAN FD frames on the socket
-fn enable_canfd(socket: &CanFdSocket) -> Result<()> {
-    let enable: libc::c_int = 1;
-    let ret = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            SOL_CAN_RAW,
-            CAN_RAW_FD_FRAMES,
-            &enable as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-
-    if ret < 0 {
-        return Err(anyhow!(
-            "Failed to enable CAN FD: {}",
-            std::io::Error::last_os_error()
-        ));
+/// Up/down decision from a link's operstate (with an `IFF_UP` fallback when operstate is absent),
+/// mirroring the old sysfs rule: CAN reports `Unknown` when up, so only Down/LowerLayerDown/
+/// NotPresent count as down. Pure so it stays unit-testable without a socket.
+fn link_is_up(oper: Option<State>, flags: LinkFlags) -> bool {
+    match oper {
+        Some(State::Down) | Some(State::LowerLayerDown) | Some(State::NotPresent) => false,
+        Some(_) => true,
+        None => flags.contains(LinkFlags::Up),
     }
-
-    Ok(())
 }
 
-/// Whether the CAN interface is currently up, read from sysfs. A missing file means the netdev is
-/// gone (treated as down).
-fn iface_is_up(iface: &str) -> bool {
-    std::fs::read_to_string(format!("/sys/class/net/{iface}/operstate"))
-        .map(|s| operstate_is_up(&s))
-        .unwrap_or(false)
+fn link_oper_state(link: &LinkMessage) -> Option<State> {
+    link.attributes.iter().find_map(|a| match a {
+        LinkAttribute::OperState(s) => Some(*s),
+        _ => None,
+    })
 }
 
-/// Decide up/down from an `operstate` string. CAN reports `unknown` when up, so treat anything that
-/// is not `down` (or empty) as up.
-fn operstate_is_up(operstate: &str) -> bool {
-    let s = operstate.trim();
-    !s.is_empty() && s != "down"
+fn link_name(link: &LinkMessage) -> Option<&str> {
+    link.attributes.iter().find_map(|a| match a {
+        LinkAttribute::IfName(n) => Some(n.as_str()),
+        _ => None,
+    })
 }
 
-/// Watch the CAN interface and force a process exit when it flaps down→up, so systemd reopens a fresh
-/// socket. A raw CAN socket stays "open" across an interface down/up but goes stale (frames stop) and
-/// the daemon would otherwise never notice. Runs for the life of the process.
+/// Process every netlink message in one datagram, updating `prev_up`. Returns true if a genuine
+/// down→up transition for `iface` was observed (the caller should exit so systemd reopens a fresh
+/// socket). Pure (no socket, no `process::exit`) so the multi-message + `NLMSG_ALIGN` walk is
+/// unit-testable without a live netlink socket.
+fn process_link_datagram(buf: &[u8], iface: &str, prev_up: &mut Option<bool>) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        let msg = match NetlinkMessage::<RouteNetlinkMessage>::deserialize(&buf[off..]) {
+            Ok(m) => m,
+            Err(_) => break,
+        };
+        let len = msg.header.length as usize;
+        if len == 0 {
+            break;
+        }
+        match &msg.payload {
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(link))
+                if link_name(link) == Some(iface) =>
+            {
+                let up = link_is_up(link_oper_state(link), link.header.flags);
+                if up && *prev_up == Some(false) {
+                    return true;
+                }
+                *prev_up = Some(up);
+            }
+            NetlinkPayload::InnerMessage(RouteNetlinkMessage::DelLink(link))
+                if link_name(link) == Some(iface) =>
+            {
+                *prev_up = Some(false);
+            }
+            _ => {}
+        }
+        off += (len + 3) & !3; // NLMSG_ALIGN to the next concatenated message
+    }
+    false
+}
+
+/// Watch the CAN interface over netlink and force a process exit when it flaps down→up, so systemd
+/// reopens a fresh socket. A raw CAN socket stays "open" across an interface down/up but goes stale
+/// (frames stop) and the daemon would otherwise never notice. Runs for the life of the process.
 fn spawn_link_monitor(iface: &str) {
     let iface = iface.to_string();
-    thread::spawn(move || {
-        let mut prev_up = iface_is_up(&iface);
-        loop {
-            thread::sleep(Duration::from_secs(1));
-            let up = iface_is_up(&iface);
-            if up && !prev_up {
-                warn!(
-                    interface = %iface,
-                    "CAN interface came back up; exiting so systemd reopens a fresh socket"
-                );
-                std::process::exit(1);
-            }
-            prev_up = up;
+    thread::spawn(move || loop {
+        // Self-healing: a returned error (socket setup or a fatal recv error) must never permanently
+        // disable flap detection, so log and retry with a fresh socket rather than exiting the thread.
+        if let Err(e) = run_link_monitor(&iface) {
+            error!(error = %e, interface = %iface, "link monitor error; retrying in 1s");
         }
+        thread::sleep(Duration::from_secs(1)); // avoid a tight spin if setup keeps failing
     });
+}
+
+fn run_link_monitor(iface: &str) -> Result<()> {
+    let mut socket = NetlinkSocket::new(NETLINK_ROUTE).context("open netlink socket")?;
+    socket.bind(&NetlinkAddr::new(0, 0)).context("bind netlink socket")?;
+    socket
+        .add_membership(RTNLGRP_LINK)
+        .context("subscribe to link events")?;
+
+    // `None` until we first observe the interface. We only restart on a genuine down→up transition
+    // (a raw CAN socket held across a down/up goes stale). The first observation just seeds the
+    // baseline, so an already-up interface and benign NEWLINK refreshes (e.g. from dhcpcd bringing
+    // the link up or address changes) never trigger a restart.
+    let mut prev_up: Option<bool> = None;
+    let mut buf: Vec<u8> = Vec::with_capacity(NETLINK_RECV_BUF);
+    loop {
+        buf.clear(); // reset len to 0 so recv_from reuses the full capacity
+        let n = match socket.recv_from(&mut buf, 0) {
+            Ok((n, _)) => n,
+            // Interrupted is benign; ENOBUFS means the receive buffer overflowed and messages were
+            // dropped, but the socket stays valid — keep going rather than tearing it down.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted
+                    || e.raw_os_error() == Some(libc::ENOBUFS) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e).context("recv netlink message"),
+        };
+
+        if process_link_datagram(&buf[..n], iface, &mut prev_up) {
+            warn!(
+                interface = %iface,
+                "CAN interface came back up; exiting so systemd reopens a fresh socket"
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Run the CAN → TCP forwarding loop with deduplication
@@ -263,14 +322,6 @@ fn handle_connection(stream: TcpStream, iface: &str) -> Result<()> {
     let can_read = CanFdSocket::open(iface).context("Failed to open CAN socket for reading")?;
     let can_write = CanFdSocket::open(iface).context("Failed to open CAN socket for writing")?;
 
-    // Enable CAN FD on both sockets
-    if let Err(e) = enable_canfd(&can_read) {
-        warn!(error = %e, "Could not enable CAN FD for read socket");
-    }
-    if let Err(e) = enable_canfd(&can_write) {
-        warn!(error = %e, "Could not enable CAN FD for write socket");
-    }
-
     // Bound the CAN read so the reader thread can observe teardown even on an idle interface.
     if let Err(e) = can_read.set_read_timeout(CAN_READ_TIMEOUT) {
         warn!(error = %e, "Could not set CAN read timeout");
@@ -329,11 +380,6 @@ fn handle_connection_with_can_socket(
     // Open write socket for TCP→CAN direction
     let can_write = CanFdSocket::open(iface).context("Failed to open CAN socket for writing")?;
 
-    // Enable CAN FD on write socket
-    if let Err(e) = enable_canfd(&can_write) {
-        warn!(error = %e, "Could not enable CAN FD for write socket");
-    }
-
     // Bound the CAN read so the reader thread can observe teardown even on an idle interface.
     if let Err(e) = can_read.set_read_timeout(CAN_READ_TIMEOUT) {
         warn!(error = %e, "Could not set CAN read timeout");
@@ -389,11 +435,6 @@ fn run_server(addr: &str, iface: &str) -> Result<()> {
         // Open CAN read socket BEFORE accepting connection so frames are buffered
         let can_read =
             CanFdSocket::open(iface).context("Failed to open CAN socket for reading")?;
-
-        // Enable CAN FD on read socket
-        if let Err(e) = enable_canfd(&can_read) {
-            warn!(error = %e, "Could not enable CAN FD for read socket");
-        }
 
         debug!("CAN socket ready, waiting for TCP connection");
 
@@ -456,8 +497,23 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_read_timeout, is_transient_write_err, operstate_is_up};
+    use super::{is_read_timeout, is_transient_write_err, link_is_up, process_link_datagram};
+    use netlink_packet_core::NetlinkMessage;
+    use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage, State};
+    use netlink_packet_route::RouteNetlinkMessage;
     use std::io::{Error, ErrorKind};
+
+    /// Serialize a single RTM_NEWLINK datagram for `iface` reporting operstate `oper`.
+    fn newlink(iface: &str, oper: State) -> Vec<u8> {
+        let mut link = LinkMessage::default();
+        link.attributes.push(LinkAttribute::IfName(iface.into()));
+        link.attributes.push(LinkAttribute::OperState(oper));
+        let mut msg = NetlinkMessage::from(RouteNetlinkMessage::NewLink(link));
+        msg.finalize();
+        let mut buf = vec![0u8; msg.buffer_len()];
+        msg.serialize(&mut buf);
+        buf
+    }
 
     #[test]
     fn transient_write_errors_keep_the_loop_alive() {
@@ -486,13 +542,45 @@ mod tests {
     }
 
     #[test]
-    fn operstate_is_up_unless_down_or_empty() {
-        assert!(operstate_is_up("up"));
-        assert!(operstate_is_up("unknown")); // CAN reports unknown when up
-        assert!(operstate_is_up("up\n")); // trailing newline from sysfs
-        assert!(!operstate_is_up("down"));
-        assert!(!operstate_is_up("down\n"));
-        assert!(!operstate_is_up(""));
-        assert!(!operstate_is_up("   "));
+    fn link_is_up_unless_operstate_down() {
+        // CAN reports Unknown when up.
+        assert!(link_is_up(Some(State::Up), LinkFlags::empty()));
+        assert!(link_is_up(Some(State::Unknown), LinkFlags::empty()));
+        assert!(!link_is_up(Some(State::Down), LinkFlags::Up));
+        assert!(!link_is_up(Some(State::LowerLayerDown), LinkFlags::empty()));
+        assert!(!link_is_up(Some(State::NotPresent), LinkFlags::empty()));
+        // No operstate attribute: fall back to the admin IFF_UP flag.
+        assert!(link_is_up(None, LinkFlags::Up));
+        assert!(!link_is_up(None, LinkFlags::empty()));
+    }
+
+    #[test]
+    fn detects_transition_across_two_messages_in_one_datagram() {
+        // Two concatenated NEWLINK messages (down then up) exercise the multi-message + NLMSG_ALIGN
+        // walk: the down seeds Some(false), and the up in the SAME datagram is the down→up trigger.
+        let mut buf = newlink("can0", State::Down);
+        while buf.len() % 4 != 0 {
+            buf.push(0); // pad to NLMSG_ALIGN before the next message, as the kernel does
+        }
+        buf.extend(newlink("can0", State::Up));
+
+        let mut prev_up = None;
+        assert!(process_link_datagram(&buf, "can0", &mut prev_up));
+    }
+
+    #[test]
+    fn first_observation_seeds_without_triggering() {
+        let buf = newlink("can0", State::Up);
+        let mut prev_up = None;
+        assert!(!process_link_datagram(&buf, "can0", &mut prev_up));
+        assert_eq!(prev_up, Some(true));
+    }
+
+    #[test]
+    fn foreign_interface_is_ignored() {
+        let buf = newlink("eth0", State::Up);
+        let mut prev_up = Some(false);
+        assert!(!process_link_datagram(&buf, "can0", &mut prev_up));
+        assert_eq!(prev_up, Some(false)); // untouched
     }
 }
