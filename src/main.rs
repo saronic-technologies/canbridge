@@ -4,7 +4,9 @@ use socketcan::{CanFdSocket, Socket};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, Receiver};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -40,6 +42,8 @@ use canbridge::{
 // SocketCAN constants
 const SOL_CAN_RAW: libc::c_int = 101;
 const CAN_RAW_FD_FRAMES: libc::c_int = 5;
+/// How long a CAN read blocks before returning so the loop can check whether teardown was requested.
+const CAN_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Enable CAN FD frames on the socket
 fn enable_canfd(socket: &CanFdSocket) -> Result<()> {
@@ -111,6 +115,7 @@ fn can_to_tcp_loop(
     mut stream: TcpStream,
     iface: &str,
     sent_frames_rx: Receiver<u64>,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     info!(interface = %iface, "[CAN→TCP] Starting forwarding loop");
 
@@ -120,9 +125,18 @@ fn can_to_tcp_loop(
     const CLEANUP_THRESHOLD: Duration = Duration::from_millis(100);
 
     loop {
-        let frame = socket
-            .read_frame()
-            .context("Failed to read frame from CAN")?;
+        // The socket has a read timeout so this loop can observe `shutdown`: without it a blocking
+        // read on an idle interface would park forever, hanging the connection teardown's join().
+        let frame = match socket.read_frame() {
+            Ok(frame) => frame,
+            Err(e) if is_read_timeout(&e) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(e) => return Err(e).context("Failed to read frame from CAN"),
+        };
 
         let wire = can_to_wire(&frame);
         let hash = frame_hash(wire.can_id, &wire.data);
@@ -161,6 +175,12 @@ fn can_to_tcp_loop(
         }
         debug!(interface = %iface, "[CAN→TCP] Sent frame over TCP");
     }
+}
+
+/// Whether a CAN read error is the benign timeout we set via [`CAN_READ_TIMEOUT`] (so the reader can
+/// observe teardown) rather than a real read failure. Pure so it is unit-testable without a socket.
+fn is_read_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
 /// Whether a CAN write error is transient — the frame can be dropped and the loop kept alive,
@@ -251,6 +271,11 @@ fn handle_connection(stream: TcpStream, iface: &str) -> Result<()> {
         warn!(error = %e, "Could not enable CAN FD for write socket");
     }
 
+    // Bound the CAN read so the reader thread can observe teardown even on an idle interface.
+    if let Err(e) = can_read.set_read_timeout(CAN_READ_TIMEOUT) {
+        warn!(error = %e, "Could not set CAN read timeout");
+    }
+
     // Create a channel for the writer to notify the reader about sent frames
     // This allows the reader to filter out looped-back frames
     let (sent_frames_tx, sent_frames_rx) = mpsc::channel();
@@ -261,10 +286,14 @@ fn handle_connection(stream: TcpStream, iface: &str) -> Result<()> {
     let stream_write = stream.try_clone().context("Failed to clone TCP stream for writer")?;
 
     let iface_clone = iface.to_string();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_reader = Arc::clone(&shutdown);
 
     // Spawn CAN → TCP thread (reads from CAN, writes to TCP)
     let can_to_tcp_handle = thread::spawn(move || {
-        if let Err(e) = can_to_tcp_loop(can_read, stream_write, &iface_clone, sent_frames_rx) {
+        if let Err(e) =
+            can_to_tcp_loop(can_read, stream_write, &iface_clone, sent_frames_rx, shutdown_reader)
+        {
             error!(error = %e, "[CAN→TCP] Thread exited with error");
         }
     });
@@ -275,9 +304,11 @@ fn handle_connection(stream: TcpStream, iface: &str) -> Result<()> {
         error!(error = %e, "[TCP→CAN] Loop exited with error");
     }
 
-    // The reverse loop has exited, so this connection is finished. Shut the socket down before joining
-    // so the CAN→TCP thread's next TCP write fails and it returns, instead of hanging join() forever
-    // while the reverse path is dead.
+    // The reverse loop has exited, so this connection is finished. Signal the reader to stop and shut
+    // the socket down so the CAN→TCP thread's next TCP write fails and it returns; the shutdown flag
+    // covers the case where that thread is instead parked on an idle CAN read (its read timeout lets
+    // it wake and observe the flag), so join() can never hang while the reverse path is dead.
+    shutdown.store(true, Ordering::Relaxed);
     let _ = stream.shutdown(Shutdown::Both);
 
     // Wait for the other thread
@@ -303,6 +334,11 @@ fn handle_connection_with_can_socket(
         warn!(error = %e, "Could not enable CAN FD for write socket");
     }
 
+    // Bound the CAN read so the reader thread can observe teardown even on an idle interface.
+    if let Err(e) = can_read.set_read_timeout(CAN_READ_TIMEOUT) {
+        warn!(error = %e, "Could not set CAN read timeout");
+    }
+
     // Create a channel for the writer to notify the reader about sent frames
     let (sent_frames_tx, sent_frames_rx) = mpsc::channel();
 
@@ -312,10 +348,14 @@ fn handle_connection_with_can_socket(
     let stream_write = stream.try_clone().context("Failed to clone TCP stream for writer")?;
 
     let iface_clone = iface.to_string();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_reader = Arc::clone(&shutdown);
 
     // Spawn CAN → TCP thread
     let can_to_tcp_handle = thread::spawn(move || {
-        if let Err(e) = can_to_tcp_loop(can_read, stream_write, &iface_clone, sent_frames_rx) {
+        if let Err(e) =
+            can_to_tcp_loop(can_read, stream_write, &iface_clone, sent_frames_rx, shutdown_reader)
+        {
             error!(error = %e, "[CAN→TCP] Thread exited with error");
         }
     });
@@ -326,9 +366,11 @@ fn handle_connection_with_can_socket(
         error!(error = %e, "[TCP→CAN] Loop exited with error");
     }
 
-    // The reverse loop has exited, so this connection is finished. Shut the socket down before joining
-    // so the CAN→TCP thread's next TCP write fails and it returns, instead of hanging join() forever
-    // while the reverse path is dead.
+    // The reverse loop has exited, so this connection is finished. Signal the reader to stop and shut
+    // the socket down so the CAN→TCP thread's next TCP write fails and it returns; the shutdown flag
+    // covers the case where that thread is instead parked on an idle CAN read (its read timeout lets
+    // it wake and observe the flag), so the server loops back to accept() instead of hanging join().
+    shutdown.store(true, Ordering::Relaxed);
     let _ = stream.shutdown(Shutdown::Both);
 
     // Wait for the other thread
@@ -414,8 +456,8 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_transient_write_err, operstate_is_up};
-    use std::io::Error;
+    use super::{is_read_timeout, is_transient_write_err, operstate_is_up};
+    use std::io::{Error, ErrorKind};
 
     #[test]
     fn transient_write_errors_keep_the_loop_alive() {
@@ -431,6 +473,16 @@ mod tests {
         assert!(!is_transient_write_err(&Error::from_raw_os_error(libc::EPERM)));
         // No errno at all (not an OS error) is treated as fatal.
         assert!(!is_transient_write_err(&Error::other("no errno")));
+    }
+
+    #[test]
+    fn read_timeout_lets_the_reader_check_for_teardown() {
+        // SO_RCVTIMEO surfaces as WouldBlock on Linux; poll-based timeouts as TimedOut.
+        assert!(is_read_timeout(&Error::from_raw_os_error(libc::EAGAIN)));
+        assert!(is_read_timeout(&Error::from(ErrorKind::WouldBlock)));
+        assert!(is_read_timeout(&Error::from(ErrorKind::TimedOut)));
+        // A real read failure is not a timeout and must stay fatal.
+        assert!(!is_read_timeout(&Error::from_raw_os_error(libc::ENETDOWN)));
     }
 
     #[test]
