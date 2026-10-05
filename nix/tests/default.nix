@@ -15,11 +15,13 @@ flake-utils.lib.eachDefaultSystem (system:
             can0 = {
               vcan-dev = "vcan0";
               can-dev = "can0";
+              addr = "server";
               port = 4242;
             };
             can1 = {
               vcan-dev = "vcan1";
               can-dev = "can1";
+              addr = "server";
               port = 4243;
             };
           };
