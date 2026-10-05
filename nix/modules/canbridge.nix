@@ -13,7 +13,8 @@ in
         can0 = {
           vcan-dev = "vcan0";
           can-dev = "can0";
-          addr = "server";
+          connectAddr = "server";
+          listenAddr = "0.0.0.0";
           port = 4242;
         };
       };
@@ -31,9 +32,15 @@ in
             description = "CAN device for ${name}.";
           };
 
-          addr = mkOption {
+          connectAddr = mkOption {
+            default = "server";
             type = types.str;
-            description = "Address used by ${name}.";
+            description = "Host or IP the client connects to for ${name}.";
+          };
+          listenAddr = mkOption {
+            default = "0.0.0.0";
+            type = types.str;
+            description = "Address the server listens on for ${name}.";
           };
           port = mkOption {
             type = types.port;
@@ -87,7 +94,7 @@ in
           Type = "simple";
           Restart = "always";
           RestartSec = "1";
-          ExecStart = "${pkgs.canbridge.canbridge}/bin/canbridge --mode connect --addr ${devCfg.addr}:${toString devCfg.port} --iface ${devCfg.vcan-dev}";
+          ExecStart = "${pkgs.canbridge.canbridge}/bin/canbridge --mode connect --addr ${devCfg.connectAddr}:${toString devCfg.port} --iface ${devCfg.vcan-dev}";
         };
       };
     };
@@ -129,7 +136,7 @@ in
           Type = "simple";
           Restart = "always";
           RestartSec = "1";
-          ExecStart = "${pkgs.canbridge.canbridge}/bin/canbridge --mode listen --addr ${devCfg.addr}:${toString devCfg.port} --iface ${devCfg.can-dev}";
+          ExecStart = "${pkgs.canbridge.canbridge}/bin/canbridge --mode listen --addr ${devCfg.listenAddr}:${toString devCfg.port} --iface ${devCfg.can-dev}";
         };
       };
     };
