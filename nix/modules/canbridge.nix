@@ -8,7 +8,7 @@ in
   options.services.canbridge = {
     canbridge-cfg = mkOption {
       description = "CAN configuration keyed by interface name (e.g. can0, can1).";
-      default = {};
+      default = { };
       example = {
         can0 = {
           vcan-dev = "vcan0";
@@ -21,6 +21,7 @@ in
         options = {
           "vcan-dev" = mkOption {
             type = types.str;
+            default = name;
             description = "VCAN device for ${name}.";
           };
 
@@ -38,6 +39,8 @@ in
     };
 
     client = mkEnableOption "CANbridge Client";
+
+    clientTemplate = mkEnableOption "CANbridge client template unit";
 
     server = {
       enable = mkEnableOption "CANbridge Server";
@@ -136,16 +139,48 @@ in
     serverServices = mapAttrs' mkServerService cfg.canbridge-cfg;
     allServerServices = serverSetups // serverServices;
 
-  in mkIf (cfg.client || cfg.server.enable) {
-    # Add can-utils to system packages for testing with cansend/candump
-    environment.systemPackages = [ pkgs.can-utils ];
+    # Template client: the instance name is the vcan interface to create, and
+    # the server it connects to comes from the matching environment file.
+    clientTemplateService = {
+      description = "CAN bridge client on %i";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      serviceConfig = {
+        Type = "simple";
+        EnvironmentFile = "/run/canbridge/%i.env";
+        ExecStartPre = [
+          "-${pkgs.kmod}/bin/modprobe vcan"
+          "-${pkgs.iproute2}/bin/ip link add dev %i type vcan"
+          "${pkgs.iproute2}/bin/ip link set %i up"
+        ];
+        ExecStart =
+          "${pkgs.canbridge.canbridge}/bin/canbridge --mode connect --addr \${ADDR} --iface %i";
+        Restart = "always";
+        RestartSec = "1";
+      };
+    };
+    in
+    mkMerge [
+      (mkIf (cfg.client || cfg.server.enable || cfg.clientTemplate) {
+        # Add can-utils to system packages for testing with cansend/candump
+        environment.systemPackages = [ pkgs.can-utils ];
+      })
 
-    # Open firewall ports for server mode
-    networking.firewall.allowedTCPPorts = lib.mkIf cfg.server.enable
-      (map (devCfg: devCfg.port) (attrValues cfg.canbridge-cfg));
+      (mkIf (cfg.client || cfg.server.enable) {
+        # Open firewall ports for server mode
+        networking.firewall.allowedTCPPorts = lib.mkIf cfg.server.enable
+          (map (devCfg: devCfg.port) (attrValues cfg.canbridge-cfg));
 
-    systemd.services =
-      (if cfg.client then allClientServices else {}) //
-      (if cfg.server.enable then allServerServices else {});
-  };
+        systemd.services =
+          (if cfg.client then allClientServices else { }) //
+          (if cfg.server.enable then allServerServices else { });
+      })
+
+      (mkIf cfg.clientTemplate {
+        # Where the instance's server address is left for the unit to read.
+        systemd.tmpfiles.rules = [ "d /run/canbridge 0755 root root -" ];
+
+        systemd.services."canbridge-client@" = clientTemplateService;
+      })
+    ];
 }
