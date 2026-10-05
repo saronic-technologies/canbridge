@@ -15,11 +15,15 @@ flake-utils.lib.eachDefaultSystem (system:
             can0 = {
               vcan-dev = "vcan0";
               can-dev = "can0";
+              connectAddr = "server";
+              listenAddr = "0.0.0.0";
               port = 4242;
             };
             can1 = {
               vcan-dev = "vcan1";
               can-dev = "can1";
+              connectAddr = "server";
+              listenAddr = "0.0.0.0";
               port = 4243;
             };
           };
@@ -40,6 +44,7 @@ flake-utils.lib.eachDefaultSystem (system:
                   description = "candump vcan0 (test)";
                   wantedBy = [ "multi-user.target" ];
                   after = [ "network-online.target" ];
+                  wants = [ "network-online.target" ];
                   serviceConfig = {
                     Type = "simple";
                     Restart = "always";
@@ -54,6 +59,7 @@ flake-utils.lib.eachDefaultSystem (system:
                   description = "candump vcan1 (test)";
                   wantedBy = [ "multi-user.target" ];
                   after = [ "network-online.target" ];
+                  wants = [ "network-online.target" ];
                   serviceConfig = {
                     Type = "simple";
                     Restart = "always";
@@ -87,6 +93,7 @@ flake-utils.lib.eachDefaultSystem (system:
                   description = "candump can0 (test)";
                   wantedBy = [ "multi-user.target" ];
                   after = [ "network-online.target" ];
+                  wants = [ "network-online.target" ];
                   serviceConfig = {
                     Type = "simple";
                     Restart = "always";
@@ -101,6 +108,7 @@ flake-utils.lib.eachDefaultSystem (system:
                   description = "candump can1 (test)";
                   wantedBy = [ "multi-user.target" ];
                   after = [ "network-online.target" ];
+                  wants = [ "network-online.target" ];
                   serviceConfig = {
                     Type = "simple";
                     Restart = "always";
@@ -146,13 +154,13 @@ flake-utils.lib.eachDefaultSystem (system:
             name = "candump-vcan1-log";
             text = builtins.readFile ./candump-vcan1.log;
           };
-          
+
         in ''
             import time
             # Make sure all services come up healthy
-            client.wait_for_unit("canbridge-client-can0-setup.service") 
+            client.wait_for_unit("canbridge-client-can0-setup.service")
             client.wait_for_unit("canbridge-client-can0.service")
-            client.wait_for_unit("canbridge-client-can1-setup.service") 
+            client.wait_for_unit("canbridge-client-can1-setup.service")
             client.wait_for_unit("canbridge-client-can1.service")
 
             server.wait_for_unit("canbridge-server-can0.service")
@@ -160,10 +168,10 @@ flake-utils.lib.eachDefaultSystem (system:
             server.wait_for_unit("canbridge-server-can1.service")
             server.wait_for_unit("canbridge-server-can1-setup.service")
 
-            client.wait_for_unit("candump-vcan0.service") 
+            client.wait_for_unit("candump-vcan0.service")
             client.wait_for_unit("candump-vcan1.service")
 
-            server.wait_for_unit("candump-can0.service") 
+            server.wait_for_unit("candump-can0.service")
             server.wait_for_unit("candump-can1.service")
 
             frame = "123#DEADBEEF"
