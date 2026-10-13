@@ -416,6 +416,7 @@ fn handle_connection(stream: TcpStream, iface: &str) -> Result<()> {
     // that when one direction's loop exits we can tear the connection down and unblock the other.
     let stream_read = stream.try_clone().context("Failed to clone TCP stream")?;
     let stream_write = stream.try_clone().context("Failed to clone TCP stream for writer")?;
+    let reader_shutdown = stream.try_clone().context("Failed to clone TCP shutdown handle")?;
 
     let iface_clone = iface.to_string();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -428,6 +429,8 @@ fn handle_connection(stream: TcpStream, iface: &str) -> Result<()> {
         {
             error!(error = %e, "[CAN→TCP] Thread exited with error");
         }
+        // Dropping a clone leaves the TCP reader open. End the session even when TCP is idle.
+        let _ = reader_shutdown.shutdown(Shutdown::Both);
     });
 
     // Run TCP → CAN in main thread (reads from TCP, writes to CAN)
@@ -473,6 +476,7 @@ fn handle_connection_with_can_socket(
     // that when one direction's loop exits we can tear the connection down and unblock the other.
     let stream_read = stream.try_clone().context("Failed to clone TCP stream")?;
     let stream_write = stream.try_clone().context("Failed to clone TCP stream for writer")?;
+    let reader_shutdown = stream.try_clone().context("Failed to clone TCP shutdown handle")?;
 
     let iface_clone = iface.to_string();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -485,6 +489,8 @@ fn handle_connection_with_can_socket(
         {
             error!(error = %e, "[CAN→TCP] Thread exited with error");
         }
+        // Dropping a clone leaves the TCP reader open. End the session even when TCP is idle.
+        let _ = reader_shutdown.shutdown(Shutdown::Both);
     });
 
     // Run TCP → CAN in main thread

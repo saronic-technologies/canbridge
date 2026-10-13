@@ -1,4 +1,4 @@
-{ self, nixpkgs, flake-utils, ... }:
+{ self, nixpkgs, flake-utils, crane, rust-overlay, ... }:
 flake-utils.lib.eachDefaultSystem (system:
   let
     overlays = [ self.overlays.default ];
@@ -8,6 +8,14 @@ flake-utils.lib.eachDefaultSystem (system:
   in
     with pkgs;
     {
+      packages.canbridge-cleanup-listen-test = import ./connection-cleanup.nix {
+        inherit self pkgs crane rust-overlay;
+        mode = "listen";
+      };
+      packages.canbridge-cleanup-connect-test = import ./connection-cleanup.nix {
+        inherit self pkgs crane rust-overlay;
+        mode = "connect";
+      };
       packages.canbridge-test = testers.runNixOSTest {
         name = "canbridge-test";
         nodes = let
