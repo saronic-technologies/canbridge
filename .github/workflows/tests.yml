@@ -29,3 +29,15 @@ jobs:
       run: nix build -L .#canbridge-test
     - name: Run idle CAN failure regressions
       run: nix build -L .#canbridge-cleanup-listen-test .#canbridge-cleanup-connect-test
+
+  build-status:
+    name: build
+    needs: build
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+    - name: Require both architecture jobs to pass
+      env:
+        BUILD_RESULT: ${{ needs.build.result }}
+      run: test "$BUILD_RESULT" = success
