@@ -5,18 +5,22 @@ flake-utils.lib.eachDefaultSystem (system:
     pkgs = import nixpkgs {
       inherit system overlays;
     };
+    # QEMU falls back to TCG when KVM is unavailable, including on hosted ARM runners.
+    runTest = test: (pkgs.testers.runNixOSTest test).overrideTestDerivation (old: {
+      requiredSystemFeatures = builtins.filter (feature: feature != "kvm") old.requiredSystemFeatures;
+    });
   in
     with pkgs;
     {
       packages.canbridge-cleanup-listen-test = import ./connection-cleanup.nix {
-        inherit self pkgs crane rust-overlay;
+        inherit self pkgs crane rust-overlay runTest;
         mode = "listen";
       };
       packages.canbridge-cleanup-connect-test = import ./connection-cleanup.nix {
-        inherit self pkgs crane rust-overlay;
+        inherit self pkgs crane rust-overlay runTest;
         mode = "connect";
       };
-      packages.canbridge-test = testers.runNixOSTest {
+      packages.canbridge-test = runTest {
         name = "canbridge-test";
         nodes = let
           canbridge-config = {

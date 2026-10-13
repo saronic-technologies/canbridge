@@ -1,4 +1,4 @@
-{ self, pkgs, crane, rust-overlay, mode }:
+{ self, pkgs, crane, rust-overlay, runTest, mode }:
 let
   rustPkgs = import pkgs.path {
     inherit (pkgs.stdenv.hostPlatform) system;
@@ -16,7 +16,7 @@ let
     '';
   };
 in
-pkgs.testers.runNixOSTest {
+runTest {
   name = "canbridge-cleanup-${mode}";
   nodes.machine = { ... }: {
     boot.kernelModules = [ "vcan" ];

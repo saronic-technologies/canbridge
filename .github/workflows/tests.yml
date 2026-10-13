@@ -13,6 +13,7 @@ jobs:
   build:
 
     strategy:
+      fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
@@ -25,6 +26,6 @@ jobs:
     - name: Run cargo tests
       run: nix develop --command cargo test --locked --verbose
     - name: Run NixOS VM test
-      run: nix build .#canbridge-test
+      run: nix build -L .#canbridge-test
     - name: Run idle CAN failure regressions
       run: nix build -L .#canbridge-cleanup-listen-test .#canbridge-cleanup-connect-test
