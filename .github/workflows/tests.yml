@@ -12,17 +12,32 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
 
     steps:
     - uses: actions/checkout@v4
     - uses: DeterminateSystems/nix-installer-action@main
-    - name: Enter nix shell
-      run: nix develop
     - name: Build
-      run: cargo build --verbose
+      run: nix develop --command cargo build --locked --verbose
     - name: Run cargo tests
-      run: cargo test --verbose
+      run: nix develop --command cargo test --locked --verbose
     - name: Run NixOS VM test
-      run: nix build .#canbridge-test
-      
+      run: nix build -L .#canbridge-test
+    - name: Run idle CAN failure regressions
+      run: nix build -L .#canbridge-cleanup-listen-test .#canbridge-cleanup-connect-test
+
+  build-status:
+    name: build
+    needs: build
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+    - name: Require both architecture jobs to pass
+      env:
+        BUILD_RESULT: ${{ needs.build.result }}
+      run: test "$BUILD_RESULT" = success
